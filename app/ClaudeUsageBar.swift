@@ -50,6 +50,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create status bar item with variable length for compact display
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
+        // The initial status title reads the configured accounts.
+        usageManager = UsageManager(statusItem: statusItem, delegate: self)
+
         if let button = statusItem.button {
             // Create Claude logo as initial icon
             updateStatusIcon(percentage: 0)
@@ -63,20 +66,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Initialize managers
-        usageManager = UsageManager(statusItem: statusItem, delegate: self)
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
         // Create popover
         popover = NSPopover()
-        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 360, height: 320)
+        popover.contentSize = NSSize(width: 360, height: 520)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
             updateManager: updateManager
         ))
+        popover.contentSize = NSSize(width: 360, height: 520)
 
         // Appearance preference: "system" (default) tracks the macOS light/dark
         // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
@@ -302,6 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            positionPopoverBelowMenuBar(button)
 
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
@@ -319,6 +322,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
+        }
+    }
+
+    private func positionPopoverBelowMenuBar(_ button: NSStatusBarButton) {
+        DispatchQueue.main.async {
+            guard let window = self.popover.contentViewController?.view.window,
+                  let screen = button.window?.screen ?? window.screen else { return }
+
+            let visibleFrame = screen.visibleFrame
+            let anchorFrame = button.convert(button.bounds, to: nil)
+            let anchorCenterX = button.window?.convertToScreen(anchorFrame).midX ?? visibleFrame.midX
+            let originX = min(max(anchorCenterX - window.frame.width / 2, visibleFrame.minX),
+                              visibleFrame.maxX - window.frame.width)
+            window.setFrameOrigin(NSPoint(x: originX, y: visibleFrame.maxY - window.frame.height))
         }
     }
 
@@ -340,7 +357,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        button.title = " \(usageManager.statusBarTitle())"
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -411,6 +428,7 @@ struct Account: Identifiable, Codable, Equatable {
     let id: String
     var name: String
     var cookie: String
+    var sessionPercentage: Int?
 }
 
 class UsageManager: ObservableObject {
@@ -454,6 +472,22 @@ class UsageManager: ObservableObject {
 
     var activeAccount: Account? {
         accounts.first { $0.id == activeAccountId }
+    }
+
+    func statusBarTitle() -> String {
+        guard !accounts.isEmpty else { return "No accounts" }
+
+        return accounts.enumerated().map { index, account in
+            let percentageText = account.sessionPercentage.map { "\($0)%" } ?? "--"
+            return "\(index + 1): \(percentageText)"
+        }.joined(separator: "  ")
+    }
+
+    func storeSessionPercentage(_ percentage: Int, for accountId: String?) {
+        guard let accountId,
+              let index = accounts.firstIndex(where: { $0.id == accountId }) else { return }
+        accounts[index].sessionPercentage = percentage
+        persistAccounts()
     }
 
     private var statusItem: NSStatusItem?
@@ -708,9 +742,11 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func fetchOrganizationId(completion: @escaping (String?) -> Void) {
+    func fetchOrganizationId(cookie: String? = nil, completion: @escaping (String?) -> Void) {
+        let cookieToUse = cookie ?? sessionCookie
+
         // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
+        let cookieParts = cookieToUse.components(separatedBy: ";")
         for part in cookieParts {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
@@ -729,7 +765,7 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        request.setValue("sessionKey=\(cookieToUse)", forHTTPHeaderField: "Cookie")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
@@ -772,7 +808,50 @@ class UsageManager: ObservableObject {
             self.fetchUsageWithOrgId(orgId)
             self.fetchExtraUsage(orgId)
             self.fetchFreeCredits(orgId)
+            self.refreshInactiveAccountSessionPercentages()
         }
+    }
+
+    func refreshInactiveAccountSessionPercentages() {
+        for account in accounts where account.id != activeAccountId && !account.cookie.isEmpty {
+            fetchSessionPercentage(for: account)
+        }
+    }
+
+    func fetchSessionPercentage(for account: Account) {
+        fetchOrganizationId(cookie: account.cookie) { [weak self] orgId in
+            guard let self = self, let orgId = orgId else { return }
+            self.fetchSessionPercentageWithOrgId(orgId, cookie: account.cookie, accountId: account.id)
+        }
+    }
+
+    func fetchSessionPercentageWithOrgId(_ orgId: String, cookie: String, accountId: String) {
+        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self = self,
+                      let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200,
+                      let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let fiveHour = json["five_hour"] as? [String: Any],
+                      let sessionUtil = fiveHour["utilization"] as? Double else { return }
+
+                self.storeSessionPercentage(Int(sessionUtil), for: accountId)
+                self.delegate?.updateStatusIcon(percentage: Int((Double(self.sessionUsage) / Double(self.sessionLimit)) * 100))
+            }
+        }.resume()
     }
 
     // Remaining free/promo credits (balance) from /prepaid/credits.
@@ -1023,6 +1102,8 @@ class UsageManager: ObservableObject {
 
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+
+        storeSessionPercentage(sessionPercent, for: activeAccountId)
 
         // Update the icon color
         delegate?.updateStatusIcon(percentage: sessionPercent)
@@ -1663,7 +1744,7 @@ struct UsageView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
 
-    private let maxPopupHeight: CGFloat = 600
+    private let maxPopupHeight: CGFloat = 520
 
     var body: some View {
         ScrollViewReader { proxy in

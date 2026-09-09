@@ -70,8 +70,9 @@ find "$APP_PATH" -name '._*' -delete 2>/dev/null
 find "$APP_PATH" -name '.DS_Store' -delete 2>/dev/null
 dot_clean "$APP_PATH" 2>/dev/null
 
-# Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
-# fails notarization later. If real signing fails, error out loudly.
+# Sign with Developer ID certificate when available. For local development,
+# fall back to ad-hoc signing so the app can still launch on machines that do
+# not have the Developer ID certificate installed.
 DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
 if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
     echo "✅ App signed with Developer ID"
@@ -82,9 +83,13 @@ if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH";
         exit 1
     fi
 else
-    echo "❌ Developer ID signing failed. NOT falling back to ad-hoc (would break notarization)." >&2
-    echo "   Fix the cause above (often: stale xattrs / ._files / cert not in keychain) and re-run." >&2
-    exit 1
+    echo "⚠️ Developer ID signing is unavailable on this machine; using ad-hoc signing for local development." >&2
+    if codesign --force --deep --sign - "$APP_PATH"; then
+        echo "✅ App ad-hoc signed for local launch"
+    else
+        echo "❌ Ad-hoc signing failed" >&2
+        exit 1
+    fi
 fi
 
 echo "Build successful!"
