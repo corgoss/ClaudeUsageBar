@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
 import ServiceManagement
 
@@ -569,6 +568,18 @@ class UsageManager: ObservableObject {
         // Best-effort: auto-name from the account's email when left as a default.
         if trimmedName.isEmpty { fetchAccountLabelIfNeeded(for: acct.id) }
         return acct
+    }
+
+    func updateActiveAccountCookie(_ cookie: String) {
+        guard let activeAccountId,
+              let index = accounts.firstIndex(where: { $0.id == activeAccountId }) else { return }
+        accounts[index].cookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        persistAccounts()
+        resetUsageData()
+        lastNotifiedThreshold = 0
+        UserDefaults.standard.set(0, forKey: thresholdKey(for: activeAccountId))
+        fetchUsage()
+        fetchAccountLabelIfNeeded(for: activeAccountId)
     }
 
     func switchAccount(_ id: String) {
@@ -1738,6 +1749,7 @@ struct UsageView: View {
     @State private var newAccountName: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingAddAccount: Bool = false
+    @State private var replacingActiveAccountCookie: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
@@ -1878,15 +1890,25 @@ struct UsageView: View {
             }
 
             if let error = usageManager.errorMessage {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .padding(.bottom, 8)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+
+                    if error == "HTTP 403", !usageManager.accounts.isEmpty {
+                        Button(action: { beginReauthentication() }) {
+                            Label("Re-authenticate", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.bottom, 8)
             }
 
             // Only show usage if data has been fetched
             if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+                Text("👋 Sign in with Claude to get started.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
@@ -2215,19 +2237,25 @@ struct UsageView: View {
             }
             }
 
-            Button(showingCookieInput
-                   ? "Hide Accounts"
-                   : (usageManager.accounts.isEmpty ? "Set Session Cookie" : "Manage Accounts")) {
-                showingCookieInput.toggle()
-                // When there are no accounts yet, jump straight to the add form.
-                if showingCookieInput && usageManager.accounts.isEmpty {
-                    showingAddAccount = true
+            if usageManager.accounts.isEmpty {
+                Button(action: {
+                    NSWorkspace.shared.open(URL(string: "https://claude.ai/login")!)
+                }) {
+                    Label("Open Claude sign-in", systemImage: "safari")
                 }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
 
-            if showingCookieInput {
+            } else {
+                Button(action: { showingCookieInput.toggle() }) {
+                    Label(showingCookieInput ? "Hide accounts" : "Manage accounts",
+                          systemImage: "person.2")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
+
+            if usageManager.accounts.isEmpty || showingCookieInput {
                 accountsPanel
             }
 
@@ -2488,6 +2516,7 @@ struct UsageView: View {
                     }
                 }
                 Divider()
+
             }
 
             // Add-account form: always shown when there are no accounts yet,
@@ -2497,6 +2526,7 @@ struct UsageView: View {
             } else {
                 Button(action: {
                     showingAddAccount = true
+                    replacingActiveAccountCookie = false
                     sessionCookieInput = ""
                     newAccountName = ""
                 }) {
@@ -2517,7 +2547,9 @@ struct UsageView: View {
     var addAccountForm: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(usageManager.accounts.isEmpty ? "How to get your session cookie:" : "Add an account")
+                Text(replacingActiveAccountCookie
+                     ? "Re-authenticate \(activeAccountLabel)"
+                     : (usageManager.accounts.isEmpty ? "How to get your session cookie:" : "Add an account"))
                     .font(.caption)
                     .fontWeight(.semibold)
                 Spacer()
@@ -2549,14 +2581,16 @@ struct UsageView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Account name (optional):")
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                TextField("e.g. Work, Personal…", text: $newAccountName)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
+                if !replacingActiveAccountCookie {
+                    Text("Account name (optional):")
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                    TextField("e.g. Work, Personal…", text: $newAccountName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
 
-                Text("Paste full cookie string:")
+                Text(replacingActiveAccountCookie ? "Paste your new full cookie string:" : "Paste full cookie string:")
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
                     .padding(.top, 2)
@@ -2565,11 +2599,19 @@ struct UsageView: View {
                     .cornerRadius(4)
 
                 HStack(spacing: 8) {
-                    Button(usageManager.accounts.isEmpty ? "Save Cookie & Fetch" : "Add Account & Fetch") {
+                    Button(replacingActiveAccountCookie
+                           ? "Update Cookie & Fetch"
+                           : (usageManager.accounts.isEmpty ? "Save Cookie & Fetch" : "Add Account & Fetch")) {
                         let cookie = sessionCookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
                         NSLog("ClaudeUsage: Add account, cookie length: \(cookie.count)")
                         if cookie.isEmpty {
                             usageManager.errorMessage = "Cookie field is empty!"
+                        } else if replacingActiveAccountCookie {
+                            usageManager.updateActiveAccountCookie(cookie)
+                            usageManager.errorMessage = "Session updated, fetching..."
+                            sessionCookieInput = ""
+                            showingAddAccount = false
+                            replacingActiveAccountCookie = false
                         } else {
                             usageManager.addAccount(cookie: cookie, name: newAccountName)
                             usageManager.errorMessage = "Account added, fetching..."
@@ -2586,6 +2628,7 @@ struct UsageView: View {
                             sessionCookieInput = ""
                             newAccountName = ""
                             showingAddAccount = false
+                            replacingActiveAccountCookie = false
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -2593,6 +2636,14 @@ struct UsageView: View {
                 }
             }
         }
+    }
+
+    private func beginReauthentication() {
+        NSWorkspace.shared.open(URL(string: "https://claude.ai/login")!)
+        sessionCookieInput = ""
+        showingCookieInput = true
+        showingAddAccount = true
+        replacingActiveAccountCookie = true
     }
 
     func formatNumber(_ number: Int) -> String {
