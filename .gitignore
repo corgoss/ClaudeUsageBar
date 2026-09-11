@@ -67,3 +67,6 @@ temp/
 # Internal docs (kept local, not on public GitHub)
 NOTIFICATIONS.md
 internal-docs/
+
+# SwiftPM build artifacts
+.build/

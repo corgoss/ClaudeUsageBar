@@ -61,41 +61,16 @@ chmod +x build.sh
 
 The built app will be in `build/ClaudeUsageBar.app`.
 
-## 🔧 First-Time Setup
+## 📦 Set Up (10 seconds)
 
-When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these steps:
+1. Launch ClaudeUsageBar
+2. Click **Sign in with Claude**
+3. Sign in normally - Google or email both work
 
-### Getting Your Session Cookie
-
-1. Go to **Settings > Usage** on claude.ai
-2. Press **F12** (or Cmd+Option+I on Mac)
-3. Go to **Network** tab in DevTools
-4. Refresh the page, click the "usage" request
-5. Find **'Cookie'** in Request Headers
-6. Copy the **full cookie value** (starts with `anthropic-device-id=...`)
-
-### Adding Cookie to App
-
-1. Click **"Set Session Cookie"** in the app
-2. Paste your cookie (Cmd+V works!)
-3. Click **"Save Cookie & Fetch"**
-4. Your usage will appear immediately! 🎉
-
-### Using Multiple Accounts
-
-You can track more than one Claude account:
-
-1. Click **"Manage Accounts"** in the app
-2. Click **"Add another account"**, optionally give it a name (e.g. *Work*, *Personal*)
-3. Paste that account's cookie and click **"Add Account & Fetch"**
-
-Switch the active account any time from the dropdown at the top of the popover,
-or from the **Account** submenu when you right-click the menu bar icon. New
-accounts are auto-named from their email when you leave the name blank, and each
-account keeps its own usage figures and notification thresholds.
-
-> **Tip:** sign in to each account in a separate browser or private window so
-> their cookies don't overwrite each other when you copy them.
+Your session is stored in the macOS Keychain. Add more accounts the same way;
+each is kept separate, so there's no need for separate browsers. Existing pasted
+cookies are migrated automatically when you upgrade. Downgrading to an older
+version requires signing in again.
 
 ## ⚙️ Settings
 
@@ -104,6 +79,7 @@ Access settings by clicking the gear icon in the popup:
 ### Notifications
 - Enable/disable usage alerts
 - Get notifications at 25%, 50%, 75%, 90% thresholds
+- Enable daily reminders when a Claude sign-in is close to expiring
 - Click "Test Notification" to verify it works
 
 ### Keyboard Shortcut (Cmd+U)
@@ -116,7 +92,7 @@ Access settings by clicking the gear icon in the popup:
 
 ## 🔒 Privacy & Security
 
-- ✅ **All data stays on your Mac** - stored in UserDefaults only
+- ✅ **All data stays on your Mac** - account metadata is in UserDefaults and sessions are in the macOS Keychain
 - ✅ **No analytics or tracking** - zero external services
 - ✅ **Session cookies stored locally** - never sent anywhere except claude.ai
 - ✅ **No hardcoded credentials** - org ID extracted dynamically from your cookie
@@ -124,13 +100,24 @@ Access settings by clicking the gear icon in the popup:
 
 ## 🎯 How It Works
 
-1. Uses your session cookie to authenticate with claude.ai API
+1. Opens the real claude.ai sign-in page for Google or email authentication
 2. Fetches usage data from the same endpoints the website uses
-3. Extracts org ID dynamically from your cookie
+3. Keeps each account's authenticated session in a separate Keychain-backed cookie jar
 4. Displays real-time usage in your menu bar
 5. Sends notifications when you hit usage thresholds
 
 ## 🔨 Building & Distribution
+
+### First-time setup (one command)
+```bash
+../scripts/create_dev_cert.sh
+```
+Creates a self-signed code-signing certificate so local builds have a stable
+identity. Without it `build.sh` falls back to ad-hoc signing, and because a
+keychain ACL is matched against the app's designated requirement — which for an
+ad-hoc signature is the binary's own hash — **every rebuild loses access to the
+saved session and macOS prompts for your keychain password again**. Skip this
+step only if you have the Developer ID certificate installed.
 
 ### Build the App
 ```bash
@@ -151,14 +138,14 @@ rm -rf build
 ## 🐛 Troubleshooting
 
 ### "No data yet" showing
-- Make sure you've pasted your session cookie
-- Click "Save Cookie & Fetch"
-- Verify you copied the full cookie string
+- Make sure you have signed in with Claude
+- Click the refresh button to fetch usage again
+- Sign in again if the account needs attention
 
-### Cookie expired
-- Session cookies expire periodically
-- Get a new cookie from claude.ai
-- Click "Clear Cookie" then re-add it
+### Sign-in expired
+- Claude sessions expire periodically
+- Click **Sign in again** on the affected account
+- Complete normal Google or email sign-in to restore tracking
 
 ### Notifications not working
 - Click "Test Notification" in Settings
@@ -173,7 +160,7 @@ rm -rf build
 ### Usage not updating
 - App auto-refreshes every 5 minutes
 - Click the refresh button to update manually
-- If cookie expired, get a new one
+- If the session expired, sign in again
 
 ## 📦 Distribution Files
 

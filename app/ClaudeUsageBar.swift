@@ -99,12 +99,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fetch initial data
         usageManager.fetchUsage()
+        usageManager.sweepSessionHealth()
         statusManager.fetch()
         updateManager.fetch()
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
+            self.usageManager.sweepSessionHealth()
             self.statusManager.fetch()
         }
 
@@ -420,16 +422,6 @@ struct Main {
     }
 }
 
-// A single Claude account: a user-facing name plus the full session cookie
-// string pasted from claude.ai. `id` is stable so renames/switches don't
-// disturb per-account state (notification thresholds keyed on it).
-struct Account: Identifiable, Codable, Equatable {
-    let id: String
-    var name: String
-    var cookie: String
-    var sessionPercentage: Int?
-}
-
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -455,6 +447,7 @@ class UsageManager: ObservableObject {
     @Published var errorMessage: String?
     @Published var usageNotificationsEnabled: Bool = true
     @Published var statusNotificationsEnabled: Bool = true
+    @Published var sessionNotificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasWeeklyFable: Bool = false
@@ -462,42 +455,59 @@ class UsageManager: ObservableObject {
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
 
-    // Multi-account support. `accounts` holds every configured account and
-    // `activeAccountId` selects which one drives the menu bar + popover. The
-    // session cookie used for all network requests is derived from the active
-    // account, so the rest of the fetch code stays account-agnostic.
-    @Published var accounts: [Account] = []
-    @Published var activeAccountId: String?
+    let store = AccountStore()
+    var accounts: [Account] { store.accounts }
+    var activeAccountId: String? { store.activeAccountId }
+    var activeAccount: Account? { store.activeAccount }
+    private var sessions: [String: ClaudeSession] = [:]
 
-    var activeAccount: Account? {
-        accounts.first { $0.id == activeAccountId }
+    func session(for accountId: String) -> ClaudeSession {
+        if let existing = sessions[accountId] { return existing }
+        let session = ClaudeSession(accountId: accountId, cookies: store.cookies(for: accountId))
+        session.onCookiesChanged = { [weak self] cookies in
+            self?.store.saveCookies(cookies, for: accountId)
+            self?.accountsDidChange()
+        }
+        sessions[accountId] = session
+        return session
+    }
+
+    func invalidateSession(for accountId: String) {
+        sessions.removeValue(forKey: accountId)
     }
 
     func statusBarTitle() -> String {
         guard !accounts.isEmpty else { return "No accounts" }
 
-        return accounts.enumerated().map { index, account in
+        let body = accounts.enumerated().map { index, account in
             let percentageText = account.sessionPercentage.map { "\($0)%" } ?? "--"
             return "\(index + 1): \(percentageText)"
         }.joined(separator: "  ")
+
+        let needsAttention = accounts.contains { state(for: $0) == .needsSignIn }
+        return needsAttention ? body + " !" : body
     }
 
     func storeSessionPercentage(_ percentage: Int, for accountId: String?) {
+        // Only react to a real change. updateStatusBar() is this method's sole
+        // caller and accountsDidChange() calls updateStatusBar() right back, so
+        // an unconditional notify here recurses until the stack overflows.
+        // Bailing out when the value already matches also spares a JSON encode
+        // and a UserDefaults write on every poll that reports the same number.
         guard let accountId,
-              let index = accounts.firstIndex(where: { $0.id == accountId }) else { return }
-        accounts[index].sessionPercentage = percentage
-        persistAccounts()
+              let account = accounts.first(where: { $0.id == accountId }),
+              account.sessionPercentage != percentage else { return }
+        store.update(accountId) { $0.sessionPercentage = percentage }
+        accountsDidChange()
     }
 
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String { activeAccount?.cookie ?? "" }
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadAccounts()
         loadSettings()
         loadNotifiedThreshold()
         checkAccessibilityStatus()
@@ -507,112 +517,9 @@ class UsageManager: ObservableObject {
         isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
-    // MARK: - Account store
-
-    private let accountsKey = "accounts_v2"
-    private let activeAccountKey = "active_account_id"
-
-    func loadAccounts() {
-        if let data = UserDefaults.standard.data(forKey: accountsKey),
-           let decoded = try? JSONDecoder().decode([Account].self, from: data) {
-            accounts = decoded
-        }
-        activeAccountId = UserDefaults.standard.string(forKey: activeAccountKey)
-
-        // Migrate the legacy single-cookie storage (pre multi-account) into the
-        // first account so existing users keep working with no re-setup.
-        if accounts.isEmpty,
-           let legacy = UserDefaults.standard.string(forKey: "claude_session_cookie"),
-           !legacy.isEmpty {
-            let acct = Account(id: UUID().uuidString, name: "Account 1", cookie: legacy)
-            accounts = [acct]
-            activeAccountId = acct.id
-            persistAccounts()
-            fetchAccountLabelIfNeeded(for: acct.id)
-        }
-
-        // Ensure the active id always points at a real account.
-        if activeAccountId == nil || !accounts.contains(where: { $0.id == activeAccountId }) {
-            activeAccountId = accounts.first?.id
-        }
-    }
-
-    func persistAccounts() {
-        if let data = try? JSONEncoder().encode(accounts) {
-            UserDefaults.standard.set(data, forKey: accountsKey)
-        }
-        UserDefaults.standard.set(activeAccountId, forKey: activeAccountKey)
-        // Keep the legacy key mirrored to the active cookie so a downgrade to an
-        // older build still finds a usable session cookie.
-        UserDefaults.standard.set(activeAccount?.cookie ?? "", forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-    }
-
-    // Add a new account from a pasted cookie, make it active, and fetch.
-    @discardableResult
-    func addAccount(cookie: String, name: String? = nil) -> Account {
-        let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedName = (name ?? "").trimmingCharacters(in: .whitespaces)
-        let acct = Account(
-            id: UUID().uuidString,
-            name: trimmedName.isEmpty ? "Account \(accounts.count + 1)" : trimmedName,
-            cookie: trimmedCookie
-        )
-        accounts.append(acct)
-        activeAccountId = acct.id
-        persistAccounts()
-        resetUsageData()
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: thresholdKey(for: acct.id))
-        fetchUsage()
-        // Best-effort: auto-name from the account's email when left as a default.
-        if trimmedName.isEmpty { fetchAccountLabelIfNeeded(for: acct.id) }
-        return acct
-    }
-
-    func updateActiveAccountCookie(_ cookie: String) {
-        guard let activeAccountId,
-              let index = accounts.firstIndex(where: { $0.id == activeAccountId }) else { return }
-        accounts[index].cookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        persistAccounts()
-        resetUsageData()
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: thresholdKey(for: activeAccountId))
-        fetchUsage()
-        fetchAccountLabelIfNeeded(for: activeAccountId)
-    }
-
-    func switchAccount(_ id: String) {
-        guard id != activeAccountId, accounts.contains(where: { $0.id == id }) else { return }
-        activeAccountId = id
-        persistAccounts()
-        resetUsageData()
-        loadNotifiedThreshold()
-        fetchUsage()
-    }
-
-    // Allows an empty value while the user is mid-edit; a name is only committed
-    // for display once non-empty (see `displayName`).
-    func setAccountName(_ id: String, _ name: String) {
-        guard let idx = accounts.firstIndex(where: { $0.id == id }) else { return }
-        accounts[idx].name = name
-        persistAccounts()
-    }
-
-    func removeAccount(_ id: String) {
-        accounts.removeAll { $0.id == id }
-        UserDefaults.standard.removeObject(forKey: thresholdKey(for: id))
-        if activeAccountId == id {
-            activeAccountId = accounts.first?.id
-            resetUsageData()
-            loadNotifiedThreshold()
-        }
-        persistAccounts()
-        if activeAccountId != nil {
-            fetchUsage()
-        } else {
-            delegate?.updateStatusIcon(percentage: 0)
-        }
+    func accountsDidChange() {
+        objectWillChange.send()
+        updateStatusBar()
     }
 
     func displayName(for account: Account) -> String {
@@ -620,33 +527,81 @@ class UsageManager: ObservableObject {
         return trimmed.isEmpty ? "Untitled account" : trimmed
     }
 
-    // Fetch the account's email/full name from bootstrap to auto-label it,
-    // but never clobber a name the user has customised.
-    func fetchAccountLabelIfNeeded(for id: String) {
-        guard let acct = accounts.first(where: { $0.id == id }),
-              acct.name.hasPrefix("Account ") else { return }
-        let cookie = acct.cookie
-        guard let url = URL(string: "https://claude.ai/api/bootstrap") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+    @discardableResult
+    func addAccount(cookie: String, name: String? = nil) -> Account {
+        let cookies = CookiePolicy.parse(pasted: cookie)
+        let trimmedName = (name ?? "").trimmingCharacters(in: .whitespaces)
+        let candidate = Account(
+            name: trimmedName.isEmpty ? "Account \(accounts.count + 1)" : trimmedName,
+            orgId: cookies.first { $0.name == "lastActiveOrg" }?.value
+        )
+        let account: Account
+        do {
+            account = try store.upsertAccount(
+                candidate,
+                cookies: cookies
+            )
+        } catch {
+            errorMessage = "Could not save sign-in credentials: \(error)"
+            return candidate
+        }
+        accountsDidChange()
+        resetUsageData()
+        lastNotifiedThreshold = 0
+        UserDefaults.standard.set(0, forKey: thresholdKey(for: account.id))
+        fetchUsage()
+        return account
+    }
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any] else { return }
-            let label = (account["email_address"] as? String) ?? (account["full_name"] as? String)
-            guard let label = label, !label.isEmpty else { return }
-            DispatchQueue.main.async {
-                guard let idx = self.accounts.firstIndex(where: { $0.id == id }),
-                      self.accounts[idx].name.hasPrefix("Account ") else { return }
-                self.accounts[idx].name = label
-                self.persistAccounts()
-            }
-        }.resume()
+    func updateActiveAccountCookie(_ cookie: String) {
+        guard var account = activeAccount else { return }
+        let cookies = CookiePolicy.parse(pasted: cookie)
+        account.orgId = cookies.first { $0.name == "lastActiveOrg" }?.value
+        do {
+            _ = try store.upsertAccount(account, cookies: cookies)
+        } catch {
+            errorMessage = "Could not save sign-in credentials: \(error)"
+            return
+        }
+        accountsDidChange()
+        resetUsageData()
+        lastNotifiedThreshold = 0
+        UserDefaults.standard.set(0, forKey: thresholdKey(for: account.id))
+        fetchUsage()
+    }
+
+    func switchAccount(_ id: String) {
+        guard id != activeAccountId, accounts.contains(where: { $0.id == id }) else { return }
+        store.setActive(id)
+        accountsDidChange()
+        resetUsageData()
+        loadNotifiedThreshold()
+        fetchUsage()
+    }
+
+    func setAccountName(_ id: String, _ name: String) {
+        store.setName(name, for: id)
+        accountsDidChange()
+    }
+
+    func removeAccount(_ id: String) {
+        let wasActive = activeAccountId == id
+        do {
+            try store.removeAccount(id)
+        } catch {
+            errorMessage = "Could not remove account credentials: \(error)"
+            return
+        }
+        accountsDidChange()
+        if wasActive {
+            resetUsageData()
+            loadNotifiedThreshold()
+        }
+        if activeAccountId != nil {
+            fetchUsage()
+        } else {
+            delegate?.updateStatusIcon(percentage: 0)
+        }
     }
 
     // MARK: - Per-account notification threshold
@@ -711,6 +666,8 @@ class UsageManager: ObservableObject {
         if hasStatusKey {
             statusNotificationsEnabled = UserDefaults.standard.bool(forKey: "status_notifications_enabled")
         }
+        sessionNotificationsEnabled =
+            UserDefaults.standard.object(forKey: "session_notifications") as? Bool ?? true
 
         // Reflect the real system login-item state, not just a stored bool.
         if #available(macOS 13.0, *) {
@@ -729,6 +686,7 @@ class UsageManager: ObservableObject {
     func saveSettings() {
         UserDefaults.standard.set(usageNotificationsEnabled,  forKey: "usage_notifications_enabled")
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
+        UserDefaults.standard.set(sessionNotificationsEnabled, forKey: "session_notifications")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.synchronize()
@@ -753,248 +711,230 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func fetchOrganizationId(cookie: String? = nil, completion: @escaping (String?) -> Void) {
-        let cookieToUse = cookie ?? sessionCookie
+    func state(for account: Account) -> SessionState {
+        SessionStateEvaluator.evaluate(
+            expiresAt: account.expiresAt,
+            consecutiveAuthFailures: account.consecutiveAuthFailures,
+            lastFetchFailedNonAuth: account.lastFetchFailedNonAuth
+        )
+    }
 
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = cookieToUse.components(separatedBy: ";")
-        for part in cookieParts {
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lastActiveOrg=") {
-                let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
-                completion(orgId)
-                return
+    func sweepSessionHealth() {
+        for account in accounts {
+            if SessionStateEvaluator.shouldAttemptRenewal(
+                expiresAt: account.expiresAt,
+                lastRenewalAttempt: account.lastRenewalAttempt) {
+                store.update(account.id) { $0.lastRenewalAttempt = Date() }
+                SessionRenewal.attempt(accountId: account.id,
+                                       cookies: store.cookies(for: account.id)) { [weak self] renewed in
+                    guard let self, let renewed else { return }
+                    self.store.saveCookies(renewed, for: account.id)
+                    self.invalidateSession(for: account.id)
+                    self.accountsDidChange()
+                }
+            }
+
+            if case .expiringSoon(let days) = state(for: account) {
+                notifyExpiringSoon(account: account, daysRemaining: days)
             }
         }
+    }
 
-        // If not in cookie, fetch from bootstrap
-        guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
-            completion(nil)
-            return
+    private func notifyExpiringSoon(account: Account, daysRemaining: Int) {
+        guard sessionNotificationsEnabled else { return }
+
+        let key = "expiry_notified_\(account.id)"
+        let today = Calendar.current.startOfDay(for: Date())
+        if let last = UserDefaults.standard.object(forKey: key) as? Date,
+           Calendar.current.startOfDay(for: last) == today { return }
+        UserDefaults.standard.set(Date(), forKey: key)
+
+        let notification = NSUserNotification()
+        notification.title = "Claude sign-in expiring"
+        notification.informativeText = daysRemaining <= 0
+            ? "\(displayName(for: account)) expires today. Sign in again to keep tracking usage."
+            : "\(displayName(for: account)) expires in \(daysRemaining) day\(daysRemaining == 1 ? "" : "s")."
+        NSUserNotificationCenter.default.deliver(notification)
+    }
+
+    func orgId(for account: Account) -> String? {
+        if let cached = account.orgId, !cached.isEmpty { return cached }
+        let fromCookie = store.cookies(for: account.id)
+            .first { $0.name == "lastActiveOrg" }?.value
+        if let fromCookie {
+            store.update(account.id) { $0.orgId = fromCookie }
         }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("sessionKey=\(cookieToUse)", forHTTPHeaderField: "Cookie")
-
-        NSLog("📡 Fetching bootstrap to get org ID...")
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
-                  let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
-                NSLog("❌ Could not parse org ID from bootstrap")
-                completion(nil)
-                return
-            }
-            NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
-            completion(lastActiveOrgId)
-        }.resume()
+        return fromCookie
     }
 
     func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
-            }
+        guard let account = activeAccount else {
+            errorMessage = "No account configured"
+            return
+        }
+        guard let org = orgId(for: account) else {
+            errorMessage = "Sign in again to finish setting up this account"
             return
         }
 
         isLoading = true
         errorMessage = nil
 
-        // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId in
-            guard let self = self, let orgId = orgId else {
-                DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
-                    self?.isLoading = false
-                }
-                return
-            }
+        session(for: account.id).get(path: "/api/organizations/\(org)/usage") { [weak self] result in
+            guard let self else { return }
 
-            self.fetchUsageWithOrgId(orgId)
-            self.fetchExtraUsage(orgId)
-            self.fetchFreeCredits(orgId)
-            self.refreshInactiveAccountSessionPercentages()
+            switch result {
+            case .success(let data):
+                self.store.update(account.id) {
+                    $0.consecutiveAuthFailures = 0
+                    $0.lastFetchFailedNonAuth = false
+                    $0.lastSuccessfulFetch = Date()
+                }
+                guard self.activeAccountId == account.id else {
+                    self.accountsDidChange()
+                    return
+                }
+                self.isLoading = false
+                self.parseUsageData(data)
+                self.fetchFreeCredits(org, for: account.id)
+                self.fetchExtraUsage(org, for: account.id)
+                self.refreshInactiveAccountSessionPercentages()
+            case .failure(.unauthorized):
+                if self.activeAccountId == account.id {
+                    self.isLoading = false
+                }
+                self.handleAuthFailure(for: account.id)
+            case .failure(.transport), .failure(.invalidResponse):
+                self.store.update(account.id) { $0.lastFetchFailedNonAuth = true }
+                guard self.activeAccountId == account.id else {
+                    self.accountsDidChange()
+                    return
+                }
+                self.isLoading = false
+                self.errorMessage = "Network error"
+            case .failure(.http(let code)):
+                if code >= 500 {
+                    self.store.update(account.id) { $0.lastFetchFailedNonAuth = true }
+                }
+                guard self.activeAccountId == account.id else {
+                    self.accountsDidChange()
+                    return
+                }
+                self.isLoading = false
+                self.errorMessage = "HTTP \(code)"
+            }
+            self.updateStatusBar()
         }
     }
 
+    func handleAuthFailure(for accountId: String) {
+        store.update(accountId) {
+            $0.consecutiveAuthFailures += 1
+            $0.lastFetchFailedNonAuth = false
+        }
+        guard let account = accounts.first(where: { $0.id == accountId }) else { return }
+        if account.consecutiveAuthFailures == 1,
+           SessionStateEvaluator.shouldAttemptRenewal(
+               expiresAt: account.expiresAt,
+               lastRenewalAttempt: account.lastRenewalAttempt) {
+            store.update(accountId) { $0.lastRenewalAttempt = Date() }
+            SessionRenewal.attempt(accountId: accountId,
+                                   cookies: store.cookies(for: accountId)) { [weak self] renewed in
+                guard let self else { return }
+                if let renewed {
+                    self.store.saveCookies(renewed, for: accountId)
+                    self.invalidateSession(for: accountId)
+                }
+                if self.activeAccountId == accountId {
+                    self.fetchUsage()
+                }
+            }
+            return
+        }
+        guard account.consecutiveAuthFailures >= 2 else { return }
+        if activeAccountId == accountId {
+            errorMessage = nil
+        }
+        accountsDidChange()
+    }
+
     func refreshInactiveAccountSessionPercentages() {
-        for account in accounts where account.id != activeAccountId && !account.cookie.isEmpty {
+        for account in accounts where account.id != activeAccountId && !store.cookies(for: account.id).isEmpty {
             fetchSessionPercentage(for: account)
         }
     }
 
     func fetchSessionPercentage(for account: Account) {
-        fetchOrganizationId(cookie: account.cookie) { [weak self] orgId in
-            guard let self = self, let orgId = orgId else { return }
-            self.fetchSessionPercentageWithOrgId(orgId, cookie: account.cookie, accountId: account.id)
-        }
-    }
-
-    func fetchSessionPercentageWithOrgId(_ orgId: String, cookie: String, accountId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let httpResponse = response as? HTTPURLResponse,
-                      httpResponse.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let org = orgId(for: account) else { return }
+        session(for: account.id).get(path: "/api/organizations/\(org)/usage") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let data):
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let fiveHour = json["five_hour"] as? [String: Any],
-                      let sessionUtil = fiveHour["utilization"] as? Double else { return }
-
-                self.storeSessionPercentage(Int(sessionUtil), for: accountId)
-                self.delegate?.updateStatusIcon(percentage: Int((Double(self.sessionUsage) / Double(self.sessionLimit)) * 100))
+                      let utilization = fiveHour["utilization"] as? Double else { return }
+                self.store.update(account.id) {
+                    $0.sessionPercentage = Int(utilization)
+                    $0.lastFetchFailedNonAuth = false
+                    $0.lastSuccessfulFetch = Date()
+                }
+            case .failure(.unauthorized):
+                self.handleAuthFailure(for: account.id)
+                return
+            case .failure(.transport), .failure(.invalidResponse):
+                self.store.update(account.id) { $0.lastFetchFailedNonAuth = true }
+            case .failure(.http(let code)):
+                if code >= 500 {
+                    self.store.update(account.id) { $0.lastFetchFailedNonAuth = true }
+                }
             }
-        }.resume()
+            self.accountsDidChange()
+        }
     }
 
     // Remaining free/promo credits (balance) from /prepaid/credits.
-    func fetchFreeCredits(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/prepaid/credits") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                // `amount` is the current balance; fall back to summing remaining tranches.
-                if let amount = json["amount"] as? Int {
-                    self.freeCreditsMinor = amount
-                } else {
-                    var remaining = 0
-                    for key in ["tranches", "promo_tranches"] {
-                        if let arr = json[key] as? [[String: Any]] {
-                            for t in arr { remaining += (t["remaining_amount_minor_units"] as? Int) ?? 0 }
-                        }
+    func fetchFreeCredits(_ orgId: String, for accountId: String) {
+        session(for: accountId).get(path: "/api/organizations/\(orgId)/prepaid/credits") { [weak self] result in
+            guard let self, case .success(let data) = result,
+                  self.activeAccountId == accountId,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let amount = json["amount"] as? Int {
+                self.freeCreditsMinor = amount
+            } else {
+                var remaining = 0
+                for key in ["tranches", "promo_tranches"] {
+                    if let entries = json[key] as? [[String: Any]] {
+                        for entry in entries { remaining += (entry["remaining_amount_minor_units"] as? Int) ?? 0 }
                     }
-                    self.freeCreditsMinor = remaining
                 }
-                if let cur = json["currency"] as? String { self.creditCurrency = cur }
-                NSLog("🎁 Free credits left: \(self.freeCreditsMinor) \(self.creditCurrency)")
+                self.freeCreditsMinor = remaining
             }
-        }.resume()
+            if let currency = json["currency"] as? String { self.creditCurrency = currency }
+            NSLog("Free credits left: \(self.freeCreditsMinor) \(self.creditCurrency)")
+        }
     }
 
     // Extra usage spend + monthly limit live on a separate endpoint (not /usage).
-    func fetchExtraUsage(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/overage_spend_limit") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+    func fetchExtraUsage(_ orgId: String, for accountId: String) {
+        session(for: accountId).get(path: "/api/organizations/\(orgId)/overage_spend_limit") { [weak self] result in
+            guard let self, case .success(let data) = result,
+                  self.activeAccountId == accountId,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-
-                let spent = (json["used_credits"] as? Int) ?? 0
-                let limit = (json["monthly_credit_limit"] as? Int) ?? 0
-                self.extraSpentMinor = spent
-                self.extraLimitMinor = limit
-                self.creditCurrency = (json["currency"] as? String) ?? "USD"
-                if let resetStr = json["disabled_until"] as? String {
-                    let f = ISO8601DateFormatter()
-                    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    self.extraResetsAt = f.date(from: resetStr) ?? ISO8601DateFormatter().date(from: resetStr)
-                }
-                self.hasCreditUsage = spent > 0
-                NSLog("💳 Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
+            let spent = (json["used_credits"] as? Int) ?? 0
+            let limit = (json["monthly_credit_limit"] as? Int) ?? 0
+            self.extraSpentMinor = spent
+            self.extraLimitMinor = limit
+            self.creditCurrency = (json["currency"] as? String) ?? "USD"
+            if let resetString = json["disabled_until"] as? String {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                self.extraResetsAt = formatter.date(from: resetString)
+                    ?? ISO8601DateFormatter().date(from: resetString)
             }
-        }.resume()
-    }
-
-    func fetchUsageWithOrgId(_ orgId: String) {
-        let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
-
-        guard let url = URL(string: urlString) else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Invalid URL"
-                self.isLoading = false
-            }
-            return
+            self.hasCreditUsage = spent > 0
+            NSLog("Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
         }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        // Use the full cookie string (user provides all cookies, not just sessionKey)
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        NSLog("🔍 Fetching from: \(urlString)")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                self?.isLoading = false
-
-                if let error = error {
-                    NSLog("❌ Error: \(error.localizedDescription)")
-                    self?.errorMessage = "Network error"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    self?.errorMessage = "Invalid response"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                NSLog("📡 Status: \(httpResponse.statusCode)")
-
-                if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
-                }
-
-                if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
-                } else {
-                    self?.errorMessage = "HTTP \(httpResponse.statusCode)"
-                }
-
-                self?.updateStatusBar()
-            }
-        }.resume()
     }
 
     func parseUsageData(_ data: Data) {
@@ -1749,7 +1689,7 @@ struct UsageView: View {
     @State private var newAccountName: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingAddAccount: Bool = false
-    @State private var replacingActiveAccountCookie: Bool = false
+    @State private var showingAdvancedPaste = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
@@ -1894,14 +1834,24 @@ struct UsageView: View {
                     Text(error)
                         .font(.caption)
                         .foregroundColor(.orange)
+                }
+                .padding(.bottom, 8)
+            }
 
-                    if error == "HTTP 403", !usageManager.accounts.isEmpty {
-                        Button(action: { beginReauthentication() }) {
-                            Label("Re-authenticate", systemImage: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+            if let account = usageManager.activeAccount,
+               usageManager.state(for: account) == .needsSignIn {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Your Claude sign-in for \(usageManager.displayName(for: account)) has expired.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Button(action: {
+                        presentLogin(mode: .reauth(accountId: account.id,
+                                                   expectedEmail: account.email))
+                    }) {
+                        Label("Sign in again", systemImage: "person.crop.circle.badge.checkmark")
                     }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 }
                 .padding(.bottom, 8)
             }
@@ -2336,6 +2286,24 @@ struct UsageView: View {
                         }
                         .toggleStyle(.checkbox)
 
+                        Toggle(isOn: Binding(
+                            get: { usageManager.sessionNotificationsEnabled },
+                            set: { newValue in
+                                usageManager.sessionNotificationsEnabled = newValue
+                                usageManager.saveSettings()
+                            }
+                        )) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Enable Sign-in Expiry Notifications")
+                                    .font(.caption)
+                                Text("Get a daily reminder when a Claude sign-in is close to expiring")
+                                    .font(.caption2)
+                                    .foregroundColor(Color.secondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+
                         Button("Test Notification") {
                             usageManager.sendTestNotification()
                         }
@@ -2445,6 +2413,32 @@ struct UsageView: View {
         return "No account"
     }
 
+    private func presentLogin(mode: AccountLoginWindow.Mode) {
+        AccountLoginWindow.present(mode: mode, onSuccess: { email, orgId, cookies in
+            let existingId: String? = {
+                if case .reauth(let id, _) = mode { return id }
+                return nil
+            }()
+            let account = Account(
+                id: existingId ?? UUID().uuidString,
+                name: usageManager.accounts.first { $0.id == existingId }?.name ?? email,
+                email: email,
+                orgId: orgId
+            )
+            _ = try usageManager.store.upsertAccount(account, cookies: cookies)
+            usageManager.invalidateSession(for: account.id)
+            usageManager.accountsDidChange()
+            sessionCookieInput = ""
+            newAccountName = ""
+            showingAddAccount = false
+            showingAdvancedPaste = false
+            usageManager.fetchUsage()
+        }, onIdentityMismatch: { signedInAs, expected in
+            usageManager.errorMessage =
+                "Signed in as \(signedInAs), but this account is \(expected). Use \"Add account\" instead."
+        })
+    }
+
     // Compact dropdown in the header for switching between accounts.
     var accountSwitcher: some View {
         Menu {
@@ -2461,10 +2455,7 @@ struct UsageView: View {
             }
             Divider()
             Button("Add Account…") {
-                showingCookieInput = true
-                showingAddAccount = true
-                sessionCookieInput = ""
-                newAccountName = ""
+                presentLogin(mode: .newAccount)
             }
         } label: {
             HStack(spacing: 3) {
@@ -2507,6 +2498,27 @@ struct UsageView: View {
                         .textFieldStyle(.roundedBorder)
                         .font(.caption)
 
+                        switch usageManager.state(for: acct) {
+                        case .healthy:
+                            EmptyView()
+                        case .expiringSoon(let days):
+                            Text(days <= 0 ? "expires today" : "\(days)d")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                                .help("Sign-in expires soon")
+                        case .needsSignIn:
+                            Button("Sign in") {
+                                presentLogin(mode: .reauth(accountId: acct.id,
+                                                           expectedEmail: acct.email))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                        case .temporarilyUnavailable:
+                            Image(systemName: "wifi.exclamationmark")
+                                .foregroundColor(Color.secondaryText)
+                                .help("Temporarily unreachable")
+                        }
+
                         Button(action: { usageManager.removeAccount(acct.id) }) {
                             Image(systemName: "trash")
                                 .foregroundColor(.red)
@@ -2526,7 +2538,6 @@ struct UsageView: View {
             } else {
                 Button(action: {
                     showingAddAccount = true
-                    replacingActiveAccountCookie = false
                     sessionCookieInput = ""
                     newAccountName = ""
                 }) {
@@ -2546,104 +2557,71 @@ struct UsageView: View {
 
     var addAccountForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(replacingActiveAccountCookie
-                     ? "Re-authenticate \(activeAccountLabel)"
-                     : (usageManager.accounts.isEmpty ? "How to get your session cookie:" : "Add an account"))
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button(action: {
-                    NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                }) {
-                    Text("View tutorial →")
-                        .font(.caption2)
-                        .foregroundColor(.blue)
-                }
-                .buttonStyle(.borderless)
+            Button(action: { presentLogin(mode: .newAccount) }) {
+                Label("Sign in with Claude", systemImage: "person.crop.circle.badge.plus")
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("1. Go to Settings > Usage on claude.ai")
-                Text("2. Press F12 (or Cmd+Option+I)")
-                Text("3. Go to Network tab")
-                Text("4. Refresh page, click 'usage' request")
-                Text("5. Find 'Cookie' in Request Headers")
-                Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-            }
-            .font(.caption2)
-            .foregroundColor(Color.secondaryText)
-
-            Text("Tip: sign in to each account in a separate browser or private window so their cookies don't overwrite each other.")
+            Text("Opens the Claude login page. Works with Google and email sign-in.")
                 .font(.caption2)
                 .foregroundColor(Color.secondaryText)
-                .opacity(0.8)
-                .fixedSize(horizontal: false, vertical: true)
 
-            VStack(alignment: .leading, spacing: 4) {
-                if !replacingActiveAccountCookie {
-                    Text("Account name (optional):")
-                        .font(.caption2)
-                        .foregroundColor(Color.secondaryText)
-                    TextField("e.g. Work, Personal…", text: $newAccountName)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
+            DisclosureGroup("Paste cookie manually (advanced)", isExpanded: $showingAdvancedPaste) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("1. Go to Settings > Usage on claude.ai")
+                    Text("2. Press F12 (or Cmd+Option+I)")
+                    Text("3. Go to Network tab")
+                    Text("4. Refresh page, click 'usage' request")
+                    Text("5. Find 'Cookie' in Request Headers")
+                    Text("6. Copy the full cookie value")
                 }
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
 
-                Text(replacingActiveAccountCookie ? "Paste your new full cookie string:" : "Paste full cookie string:")
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                    .padding(.top, 2)
+                TextField("Account name (optional)", text: $newAccountName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+
                 PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                    .frame(height: 60)
+                    .frame(height: 50)
                     .cornerRadius(4)
 
-                HStack(spacing: 8) {
-                    Button(replacingActiveAccountCookie
-                           ? "Update Cookie & Fetch"
-                           : (usageManager.accounts.isEmpty ? "Save Cookie & Fetch" : "Add Account & Fetch")) {
-                        let cookie = sessionCookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                        NSLog("ClaudeUsage: Add account, cookie length: \(cookie.count)")
-                        if cookie.isEmpty {
-                            usageManager.errorMessage = "Cookie field is empty!"
-                        } else if replacingActiveAccountCookie {
-                            usageManager.updateActiveAccountCookie(cookie)
-                            usageManager.errorMessage = "Session updated, fetching..."
-                            sessionCookieInput = ""
-                            showingAddAccount = false
-                            replacingActiveAccountCookie = false
-                        } else {
-                            usageManager.addAccount(cookie: cookie, name: newAccountName)
-                            usageManager.errorMessage = "Account added, fetching..."
-                            sessionCookieInput = ""
-                            newAccountName = ""
-                            showingAddAccount = false
-                        }
+                Button("Save Cookie & Fetch") {
+                    let pasted = sessionCookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !pasted.isEmpty else {
+                        usageManager.errorMessage = "Cookie field is empty!"
+                        return
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-
-                    if !usageManager.accounts.isEmpty {
-                        Button("Cancel") {
-                            sessionCookieInput = ""
-                            newAccountName = ""
-                            showingAddAccount = false
-                            replacingActiveAccountCookie = false
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                    let cookies = CookiePolicy.parse(pasted: pasted)
+                    guard cookies.contains(where: { $0.name == "sessionKey" }) else {
+                        usageManager.errorMessage = "That cookie has no sessionKey in it."
+                        return
                     }
+                    let account: Account
+                    do {
+                        account = try usageManager.store.upsertAccount(
+                            Account(name: newAccountName.isEmpty ? "Account" : newAccountName,
+                                    orgId: cookies.first { $0.name == "lastActiveOrg" }?.value),
+                            cookies: cookies
+                        )
+                    } catch {
+                        usageManager.errorMessage = "Could not save sign-in credentials: \(error)"
+                        return
+                    }
+                    usageManager.invalidateSession(for: account.id)
+                    sessionCookieInput = ""
+                    newAccountName = ""
+                    showingAddAccount = false
+                    showingAdvancedPaste = false
+                    usageManager.accountsDidChange()
+                    usageManager.fetchUsage()
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
+            .font(.caption2)
         }
-    }
-
-    private func beginReauthentication() {
-        NSWorkspace.shared.open(URL(string: "https://claude.ai/login")!)
-        sessionCookieInput = ""
-        showingCookieInput = true
-        showingAddAccount = true
-        replacingActiveAccountCookie = true
     }
 
     func formatNumber(_ number: Int) -> String {

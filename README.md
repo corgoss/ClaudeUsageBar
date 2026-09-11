@@ -13,14 +13,14 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 **[Download Latest Release](https://github.com/Artzainnn/claudeusagebar/releases)** (DMG Installer)
 
-## 📦 Set Up (1mn)
+## 📦 Set Up (10 seconds)
 
-1. Go to [claude.ai/settings/usage](https://claude.ai/settings/usage)
-2. Open Developer Tools (`Cmd+Option+I`) → **Network** tab
-3. Refresh the page, click the **"usage"** request
-4. Copy the full **"Cookie"** value from the Request Headers
+1. Launch ClaudeUsageBar
+2. Click **Sign in with Claude**
+3. Sign in normally - Google or email both work
 
-![Setup Guide](setup-guide.png)
+Your session is stored in the macOS Keychain. Add more accounts the same way;
+each is kept separate, so there's no need for separate browsers.
 
 ## ✨ Features
 
@@ -41,8 +41,14 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 1. **Download** `ClaudeUsageBar-Installer.dmg` from [Releases](https://github.com/Artzainnn/ClaudeUsageBar/releases)
 2. **Open DMG** and drag ClaudeUsageBar to Applications folder
 3. **Launch** ClaudeUsageBar from Applications
-4. **Set cookie** from claude.ai (follow in-app instructions)
+4. **Sign in with Claude**
 5. **Done!** Usage appears in menu bar
+
+## 🔄 Upgrading
+
+Upgrading from a version that used pasted cookies automatically moves supported
+session cookies into the macOS Keychain. Downgrading afterwards requires signing
+in again in the older version.
 
 ## 📸 Screenshots
 
